@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forkflow"
+dynamic = ["version"]
+description = "Fetch coworker fork remotes, borrow paths onto a branch from upstream, and open a GitHub PR on the upstream repo."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+forkflow = "forkflow.scripts:main"
+forkflow-git-dir = "forkflow.scripts:git_dir"
+
+[dependency-groups]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.dynamic]
+version = { attr = "forkflow.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+forkflow = ["git/primary.sh", "git/forkflow-fetch", "git/forkflow-borrow", "git/forkflow-pr"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["forkflow"]

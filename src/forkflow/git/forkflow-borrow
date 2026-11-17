@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+#
+# forkflow borrow: start a branch from the upstream primary and take selected paths from a coworker branch.
+#
+#   forkflow borrow <remote>/<branch> <path> [<path>…]
+#   forkflow borrow -b NAME --commit -m MSG mohit/feat src/foo.py
+#   forkflow borrow --dry-run mohit/feat src/foo.py
+#
+# Fetches that remote and the primary branch, refuses a dirty tracked tree, and refuses to run with no paths
+# (a whole branch is never copied by accident). Checks the paths out and stops before the commit, unless
+# --commit -m MSG. Does not push and does not open a PR. --dry-run prints the steps and a diff against the
+# primary, and does not fetch or change the worktree.
+#
+# Branch name: -b NAME, else borrow-<remote>-<branch> with slashes turned into dashes.
+# Primary: same detection as git-sync. Overrides: GIT_PRIMARY_BRANCH, GIT_PRIMARY_REMOTE.
+#
+set -euo pipefail
+
+here="${BASH_SOURCE[0]%/*}"
+[[ "$here" == "${BASH_SOURCE[0]}" ]] && here="."
+# shellcheck source=primary.sh
+source "$here/primary.sh"
+
+log() { echo "[forkflow borrow] $*" >&2; }
+die() { log "ERROR: $1"; exit 1; }
+
+sanitize() {
+  local s="${1//\//-}"
+  s="$(printf '%s' "$s" | tr -c 'A-Za-z0-9._-' '-')"
+  while [[ "$s" == *--* ]]; do s="${s//--/-}"; done
+  while [[ "$s" == -* ]]; do s="${s#-}"; done
+  while [[ "$s" == *. ]]; do s="${s%.}"; done
+  s="${s%-}"
+  printf '%s' "$s"
+}
+
+usage() {
+  echo "usage: forkflow borrow [-b NAME] [--dry-run] [--commit -m MSG] <remote>/<branch> <path> [<path>…]" >&2
+}
+
+newbranch=""
+dry=0
+do_commit=0
+message=""
+positional=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -b)
+      [[ $# -ge 2 && "$2" != -* ]] || die "-b needs a branch name"
+      newbranch="$2"
+      shift 2
+      ;;
+    -n|--dry-run) dry=1; shift ;;
+    --commit) do_commit=1; shift ;;
+    -m)
+      [[ $# -ge 2 && "$2" != -* ]] || die "-m needs a message"
+      message="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      positional+=("$@")
+      break
+      ;;
+    -*) die "unknown option: $1" ;;
+    *) positional+=("$1"); shift ;;
+  esac
+done
+
+[[ ${#positional[@]} -ge 1 ]] || { usage; die "expected <remote>/<branch> and at least one path"; }
+ref="${positional[0]}"
+[[ "$ref" == */* ]] || die "expected <remote>/<branch>, got '$ref'"
+remote="${ref%%/*}"
+branch="${ref#*/}"
+[[ -n "$remote" && -n "$branch" ]] || die "expected <remote>/<branch>, got '$ref'"
+paths=("${positional[@]:1}")
+[[ ${#paths[@]} -ge 1 ]] || die "need at least one path (refusing to copy the whole branch). Example: forkflow borrow $remote/$branch src/foo.py"
+
+if [[ "$do_commit" == 1 && -z "$message" ]]; then
+  die "--commit needs -m MSG"
+fi
+if [[ -n "$message" && "$do_commit" != 1 ]]; then
+  die "-m needs --commit (without --commit, borrow stops before the commit)"
+fi
+
+git rev-parse --git-dir >/dev/null 2>&1 || die "not in a git repository"
+detect_primary
+
+if [[ -z "$newbranch" ]]; then
+  remote_part="$(sanitize "$remote")"
+  branch_part="$(sanitize "$branch")"
+  [[ -n "$remote_part" && -n "$branch_part" ]] || die "could not make a branch name from $remote/$branch; pass -b NAME"
+  newbranch="borrow-${remote_part}-${branch_part}"
+fi
+
+git remote get-url "$remote" >/dev/null 2>&1 || die "no remote '$remote'. Add it with: git remote add $remote <url>"
+
+dirty="$(git status --porcelain --untracked-files=no)"
+if [[ -n "$dirty" ]]; then
+  die "tracked changes in the worktree; commit or stash them first:
+$dirty"
+fi
+
+if git show-ref --verify --quiet "refs/heads/$newbranch"; then
+  die "branch $newbranch already exists; pass -b NAME"
+fi
+
+if [[ "$dry" == 1 ]]; then
+  log "dry run: git fetch $PRIMARY_REMOTE $PRIMARY"
+  log "dry run: git fetch $remote"
+  log "dry run: git switch -c $newbranch $PRIMARY_REMOTE/$PRIMARY"
+  log "dry run: git checkout $remote/$branch -- ${paths[*]}"
+  if [[ "$do_commit" == 1 ]]; then
+    log "dry run: git commit -m $message"
+  else
+    log "dry run: stop before commit"
+  fi
+  if git show-ref --verify --quiet "refs/remotes/$remote/$branch" \
+      && git show-ref --verify --quiet "refs/remotes/$PRIMARY_REMOTE/$PRIMARY"; then
+    log "diff $PRIMARY_REMOTE/$PRIMARY $remote/$branch -- ${paths[*]}"
+    git --no-pager diff "$PRIMARY_REMOTE/$PRIMARY" "$remote/$branch" -- "${paths[@]}"
+  else
+    log "no local $remote/$branch or $PRIMARY_REMOTE/$PRIMARY yet; a real run fetches first, so there is nothing to preview"
+  fi
+  exit 0
+fi
+
+log "fetching $PRIMARY_REMOTE/$PRIMARY"
+git fetch --quiet "$PRIMARY_REMOTE" "$PRIMARY" || die "git fetch $PRIMARY_REMOTE $PRIMARY failed (network or auth)"
+git show-ref --verify --quiet "refs/remotes/$PRIMARY_REMOTE/$PRIMARY" || die "no $PRIMARY_REMOTE/$PRIMARY after fetch"
+
+log "fetching $remote"
+git fetch --quiet "$remote" || die "git fetch $remote failed (network or auth)"
+git show-ref --verify --quiet "refs/remotes/$remote/$branch" || die "no $remote/$branch after fetch"
+
+git switch -c "$newbranch" "$PRIMARY_REMOTE/$PRIMARY" || die "could not create $newbranch from $PRIMARY_REMOTE/$PRIMARY"
+git checkout "$remote/$branch" -- "${paths[@]}" || die "could not take those paths from $remote/$branch; you are on $newbranch"
+
+if [[ "$do_commit" == 1 ]]; then
+  if git diff --cached --quiet; then
+    die "nothing staged to commit (those paths match $PRIMARY_REMOTE/$PRIMARY); you are on $newbranch"
+  fi
+  git commit -qm "$message" || die "git commit failed; the paths are left staged on $newbranch"
+  log "committed on $newbranch. Does not push. Next: git sync && git push -u origin $newbranch && forkflow pr -t TITLE"
+else
+  log "borrowed onto $newbranch from $PRIMARY_REMOTE/$PRIMARY (staged, not committed). Review and test, then commit. Does not push."
+  log "next: git sync && git push -u origin $newbranch && forkflow pr -t TITLE"
+fi

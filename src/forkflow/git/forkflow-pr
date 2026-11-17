@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+#
+# forkflow pr: open a pull request on the upstream repo for the branch you already pushed to origin.
+#
+#   git sync && git push -u origin HEAD && forkflow pr -t "title" -b "body"
+#
+#   --repo   owner/repo parsed from the upstream remote URL
+#   --base   the primary branch (dev.local, else main, else master)
+#   --head   <owner from origin>:<current branch>
+#
+# Passes through -t/--title, -b/--body, -F/--body-file and --draft. Refuses when gh is missing, there is no
+# upstream remote, or HEAD is not the commit on origin/$branch sitting on the primary. Does not sync or push.
+# If git sync printed a --force-with-lease push, use that push instead of a plain one.
+#
+# Primary: same detection as git-sync. Overrides: GIT_PRIMARY_BRANCH, GIT_PRIMARY_REMOTE.
+#
+set -euo pipefail
+
+here="${BASH_SOURCE[0]%/*}"
+[[ "$here" == "${BASH_SOURCE[0]}" ]] && here="."
+# shellcheck source=primary.sh
+source "$here/primary.sh"
+
+log() { echo "[forkflow pr] $*" >&2; }
+die() { log "ERROR: $1"; exit 1; }
+
+usage() {
+  echo "usage: forkflow pr -t TITLE [-b BODY | -F FILE] [--draft]" >&2
+}
+
+# owner/repo slug from a github-style remote URL (https, ssh:// or git@host:path). Empty on failure.
+remote_slug() {
+  local url="$1" path
+  url="${url%.git}"
+  url="${url%/}"
+  if [[ "$url" == *"://"* ]]; then
+    path="${url#*://}"
+    path="${path#*@}"
+    path="${path#*/}"
+  elif [[ "$url" == *:* ]]; then
+    path="${url#*:}"
+  else
+    return 1
+  fi
+  path="${path#/}"
+  [[ "$path" == */* && -n "${path%%/*}" && -n "${path#*/}" ]] || return 1
+  printf '%s' "$path"
+}
+
+title=""
+extra=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -t|--title)
+      [[ $# -ge 2 ]] || die "$1 needs a value"
+      title="$2"
+      shift 2
+      ;;
+    -b|--body|-F|--body-file)
+      [[ $# -ge 2 ]] || die "$1 needs a value"
+      extra+=("$1" "$2")
+      shift 2
+      ;;
+    --draft)
+      extra+=("--draft")
+      shift
+      ;;
+    *)
+      die "unknown argument: $1 (supported: -t/--title, -b/--body, -F/--body-file, --draft)"
+      ;;
+  esac
+done
+
+[[ -n "$title" ]] || die "pass -t TITLE"
+
+git rev-parse --git-dir >/dev/null 2>&1 || die "not in a git repository"
+git remote get-url upstream >/dev/null 2>&1 || die "no upstream remote (forkflow pr opens the PR on the upstream repo)"
+command -v gh >/dev/null 2>&1 || die "gh is not installed"
+detect_primary
+git remote get-url origin >/dev/null 2>&1 || die "no origin remote (the fork the PR head is pushed to)"
+
+branch="$(git symbolic-ref --short -q HEAD || true)"
+[[ -n "$branch" ]] || die "detached HEAD: check out the branch to open a PR for"
+[[ "$branch" != "$PRIMARY" ]] || die "on $PRIMARY: check out the branch you pushed"
+
+base_ref="refs/remotes/$PRIMARY_REMOTE/$PRIMARY"
+git show-ref --verify --quiet "$base_ref" || die "no $PRIMARY_REMOTE/$PRIMARY. Run forkflow fetch, then git sync."
+if ! git merge-base --is-ancestor "$base_ref" HEAD; then
+  die "$branch does not contain $PRIMARY_REMOTE/$PRIMARY. Run git sync, push, then forkflow pr."
+fi
+
+origin_ref="refs/remotes/origin/$branch"
+if ! git show-ref --verify --quiet "$origin_ref"; then
+  die "origin/$branch doesn't exist. Push first: git push -u origin $branch"
+fi
+if ! git merge-base --is-ancestor "$origin_ref" HEAD || ! git merge-base --is-ancestor HEAD "$origin_ref"; then
+  die "HEAD and origin/$branch differ. Push first: git push origin $branch"
+fi
+
+up_url="$(git remote get-url upstream)"
+origin_url="$(git remote get-url origin)"
+up_slug="$(remote_slug "$up_url")" || die "could not parse owner/repo from upstream URL: $up_url"
+origin_slug="$(remote_slug "$origin_url")" || die "could not parse owner/repo from origin URL: $origin_url"
+fork_owner="${origin_slug%%/*}"
+
+log "gh pr create --repo $up_slug --base $PRIMARY --head $fork_owner:$branch"
+if [[ ${#extra[@]} -gt 0 ]]; then
+  exec gh pr create --repo "$up_slug" --base "$PRIMARY" --head "$fork_owner:$branch" --title "$title" "${extra[@]}"
+fi
+exec gh pr create --repo "$up_slug" --base "$PRIMARY" --head "$fork_owner:$branch" --title "$title"

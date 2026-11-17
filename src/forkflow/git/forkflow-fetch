@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+#
+# forkflow fetch: refresh every remote of the repo you're in.
+#
+#   1. the primary remote's primary branch   (remote: upstream, else origin; primary: dev.local, main or master)
+#   2. origin                                 (the whole fork, when it isn't already the primary remote)
+#   3. every other remote                     (coworker forks: mohit, nishchay, …)
+#
+# Same primary detection as git-sync. Overrides: GIT_PRIMARY_BRANCH, GIT_PRIMARY_REMOTE.
+#
+set -euo pipefail
+
+here="${BASH_SOURCE[0]%/*}"
+[[ "$here" == "${BASH_SOURCE[0]}" ]] && here="."
+# shellcheck source=primary.sh
+source "$here/primary.sh"
+
+log() { echo "[forkflow fetch] $*" >&2; }
+die() { log "ERROR: $1"; exit 1; }
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  echo "usage: forkflow fetch" >&2
+  exit 0
+fi
+[[ $# -eq 0 ]] || die "usage: forkflow fetch"
+git rev-parse --git-dir >/dev/null 2>&1 || die "not in a git repository"
+detect_primary
+
+if [[ "$PRIMARY_REMOTE" == "origin" ]]; then
+  log "fetching origin"
+  git fetch --quiet origin || die "git fetch origin failed (network or auth)"
+else
+  log "fetching $PRIMARY_REMOTE/$PRIMARY"
+  git fetch --quiet "$PRIMARY_REMOTE" "$PRIMARY" || die "git fetch $PRIMARY_REMOTE $PRIMARY failed (network or auth)"
+  if git remote get-url origin >/dev/null 2>&1; then
+    log "fetching origin"
+    git fetch --quiet origin || die "git fetch origin failed (network or auth)"
+  else
+    log "no origin remote; skipped"
+  fi
+fi
+
+while IFS= read -r name; do
+  [[ -z "$name" || "$name" == "$PRIMARY_REMOTE" || "$name" == "origin" ]] && continue
+  log "fetching $name"
+  git fetch --quiet "$name" || die "git fetch $name failed (network or auth)"
+done < <(git remote)
+
+log "done"
